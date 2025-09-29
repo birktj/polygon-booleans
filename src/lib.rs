@@ -1,6 +1,6 @@
 use rstar::{PointDistance, RTree, RTreeObject, SelectionFunction};
 
-mod geometry;
+pub mod geometry;
 
 pub type Point = geometry::Point<f64>;
 pub type Line = geometry::LineSegment<f64>;
@@ -24,6 +24,19 @@ pub struct PolygonRegion {
 }
 
 impl PolygonRegion {
+    pub fn new(epsilon: f64) -> Self {
+        Self {
+            points: RTree::new(),
+            edges: RTree::new(),
+            epsilon,
+            epsilon2: epsilon * epsilon,
+        }
+    }
+
+    pub fn epsilon(&self) -> f64 {
+        self.epsilon
+    }
+
     fn check_finite_precision(&self) -> Result<(), InvariantError> {
         // (1) Check that all points are at least epsilon distance apart.
         for p in self.points.iter() {
@@ -76,37 +89,51 @@ impl PolygonRegion {
         })
     }
 
-    fn check_region(&self) -> Result<(), InvariantError> {
+    pub fn check_region(&self) -> Result<(), InvariantError> {
         self.check_finite_precision()?;
 
         Ok(())
     }
 
-    fn find_points_close_line(&self, line: &Line) -> impl '_ + Iterator<Item = Point> {
+    pub fn points(&self) -> impl '_ + Iterator<Item = Point> {
+        self.points.iter().copied().map(|p| p.into())
+    }
+
+    pub fn edges(&self) -> impl '_ + Iterator<Item = Line> {
+        self.edges.iter().copied().map(|p| p.into())
+    }
+
+    fn find_points_close_to_line(&self, line: &Line) -> impl '_ + Iterator<Item = Point> {
         struct Selector {
             line: Line,
-            epsilon2: f64,
+            epsilon: f64,
         }
 
         impl SelectionFunction<IntPoint> for Selector {
-            fn should_unpack_parent(&self, envelope: &<IntPoint as RTreeObject>::Envelope) -> bool {
+            fn should_unpack_parent(&self, envelope: &rstar::AABB<IntPoint>) -> bool {
+                geometry::Rectangle::from(*envelope).line_segment_distance(&self.line)
+                    <= self.epsilon
+            }
+
+            fn should_unpack_leaf(&self, leaf: &IntPoint) -> bool {
+                self.line.point_distance(&Point::from(*leaf)) <= self.epsilon
             }
         }
+
+        let line = *line;
+
+        self.points
+            .locate_with_selection_function(Selector {
+                line,
+                epsilon: self.epsilon,
+            })
+            .copied()
+            .map(|p| Point::from(p))
+            .filter(move |p| p != &line.from && p != &line.to)
     }
 
-    pub fn accomodate(&mut self, point: Point) {
-        for _p in self
-            .points
-            .drain_within_distance(point.into(), self.epsilon2)
-        {}
-        self.points.insert(point.into());
-
-        let mut es = self
-            .edges
-            .drain_within_distance(point.into(), self.epsilon2)
-            .collect::<Vec<_>>();
-
-        while let Some(e) = es.pop() {
+    fn crack_edges(&mut self, mut edges: Vec<IntLine>) {
+        while let Some(e) = edges.pop() {
             if self.edges.contains(&e) {
                 continue;
             }
@@ -121,25 +148,52 @@ impl PolygonRegion {
                 continue;
             }
 
-            let mut close_points = self.find_points_close_line(&e.into()).collect::<Vec<_>>();
+            let mut close_points = self
+                .find_points_close_to_line(&e.into())
+                .map(|p| (Line::from(e).project(&p), p))
+                .collect::<Vec<_>>();
+
             if close_points.is_empty() {
                 self.edges.insert(e);
                 continue;
             }
 
             // Crack edge
-            close_points.sort_by_cached_key(|p| Line::from(e).project(p));
+            close_points.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+            close_points.push((1.0, e.to.into()));
 
             let mut p1 = e.from;
-            let mut p2 = close_points[0].into();
+            let mut p2 = close_points[0].1.into();
 
-            es.push(IntLine { from: p1, to: p2 });
+            edges.push(IntLine { from: p1, to: p2 });
 
             for i in 1..close_points.len() {
                 p1 = p2;
-                p2 = close_points[i].into();
-                es.push(IntLine { from: p1, to: p2 });
+                p2 = close_points[i].1.into();
+                edges.push(IntLine { from: p1, to: p2 });
             }
         }
+    }
+
+    pub fn accomodate(&mut self, point: Point) {
+        for _p in self
+            .points
+            .drain_within_distance(point.into(), self.epsilon2)
+        {}
+        self.points.insert(point.into());
+
+        let es = self
+            .edges
+            .drain_within_distance(point.into(), self.epsilon2)
+            .collect::<Vec<_>>();
+
+        self.crack_edges(es);
+    }
+
+    pub fn add_edge(&mut self, line: Line) {
+        self.accomodate(line.from);
+        self.accomodate(line.to);
+
+        self.crack_edges(vec![line.into()]);
     }
 }

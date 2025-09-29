@@ -267,3 +267,12 @@ impl<T: na::Scalar> Rectangle<T> {
             .unwrap()
     }
 }
+
+impl<T: na::Scalar + rstar::RTreeNum> From<rstar::AABB<mint::Point2<T>>> for Rectangle<T> {
+    fn from(value: rstar::AABB<mint::Point2<T>>) -> Self {
+        Self {
+            min_p: value.lower().into(),
+            max_p: value.upper().into(),
+        }
+    }
+}
